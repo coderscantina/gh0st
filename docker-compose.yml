@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  gh0st:
+    build: .
+    image: gh0st:latest
+    container_name: gh0st-crawler
+    volumes:
+      # Mount directory for output files
+      - ./output:/data
+    environment:
+      # Set timezone
+      - TZ=UTC
+      # Enable Rust backtrace for debugging
+      - RUST_BACKTRACE=1
+    # Override default command - example crawl
+    # Uncomment and modify for your use case
+    # command: ["https://example.com", "-o", "/data/results.csv", "--no-tui"]
+
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+
+    # Network mode
+    network_mode: bridge
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+    # Read-only root filesystem (output dir is mounted)
+    read_only: false
+
+    # Drop unnecessary capabilities
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # Optional: WebDriver service for JavaScript rendering
+  # Uncomment to enable browser automation capabilities
+  # firefox:
+  #   image: selenium/standalone-firefox:latest
+  #   container_name: gh0st-webdriver
+  #   ports:
+  #     - "4444:4444"
+  #   shm_size: 2gb
+  #   environment:
+  #     - SE_NODE_MAX_SESSIONS=5
+  #     - SE_NODE_SESSION_TIMEOUT=300
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: '2'
+  #         memory: 2G
+
+  # Alternative: Chrome WebDriver
+  # chrome:
+  #   image: selenium/standalone-chrome:latest
+  #   container_name: gh0st-webdriver-chrome
+  #   ports:
+  #     - "4444:4444"
+  #   shm_size: 2gb
+  #   environment:
+  #     - SE_NODE_MAX_SESSIONS=5
+  #     - SE_NODE_SESSION_TIMEOUT=300
+
+# Create named volume for persistent data (optional)
+volumes:
+  gh0st_data:
+    driver: local
+
+# Network configuration
+networks:
+  default:
+    driver: bridge

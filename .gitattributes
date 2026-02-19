@@ -1,0 +1,33 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Rust source files
+*.rs text eol=lf
+*.toml text eol=lf
+
+# Documentation
+*.md text eol=lf
+LICENSE text eol=lf
+
+# Scripts
+*.sh text eol=lf
+
+# Windows scripts
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Configuration files
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Archive files - don't treat as text
+*.zip binary
+*.tar.gz binary
+*.tgz binary
+
+# Exclude from archives
+.gitattributes export-ignore
+.gitignore export-ignore
+.github export-ignore
+target export-ignore
+*.log export-ignore

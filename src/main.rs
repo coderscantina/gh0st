@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -8,19 +8,24 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{ArgAction, Parser, ValueEnum};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Gauge, Paragraph, Row, Table, TableState, Tabs, Wrap,
+};
 use scraper::{Html, Selector};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spider::ClientBuilder;
 use spider::page::Page;
@@ -34,14 +39,25 @@ use url::Url;
 #[command(
     name = "spider-tui",
     version,
-    about = "TUI crawler powered by spider with live CSV output"
+    about = "TUI crawler powered by spider with live CSV/JSON output"
 )]
 struct Cli {
-    #[arg(value_name = "URL")]
-    url: String,
+    #[arg(value_name = "URL", required_unless_present = "review_file")]
+    url: Option<String>,
 
-    #[arg(short, long, value_name = "FILE", default_value = "crawl.csv")]
-    output: String,
+    #[arg(
+        long = "review",
+        alias = "review-csv",
+        alias = "review-json",
+        value_name = "FILE"
+    )]
+    review_file: Option<String>,
+
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = FileFormatArg::Csv)]
+    format: FileFormatArg,
 
     #[arg(long, default_value_t = false)]
     subdomains: bool,
@@ -121,6 +137,12 @@ enum BrowserArg {
     Safari,
 }
 
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+enum FileFormatArg {
+    Csv,
+    Json,
+}
+
 #[derive(Debug, Clone)]
 struct CrawlRow {
     url: String,
@@ -141,7 +163,241 @@ struct CrawlRow {
     redirect_url: String,
     redirect_type: String,
     link_count: usize,
+    internal_link_count: usize,
+    external_link_count: usize,
+    h1_count: usize,
+    h2_count: usize,
+    image_count: usize,
+    image_missing_alt_count: usize,
+    structured_data_count: usize,
+    seo_score: u8,
+    issues: Vec<SeoIssue>,
     crawl_timestamp: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SeoIssue {
+    NotRetrieved,
+    Http4xx,
+    Http5xx,
+    Noindex,
+    MissingTitle,
+    TitleTooShort,
+    TitleTooLong,
+    MissingMetaDescription,
+    MetaDescriptionTooShort,
+    MetaDescriptionTooLong,
+    MissingH1,
+    MultipleH1,
+    MissingCanonical,
+    LowWordCount,
+    ImagesMissingAlt,
+    TooManyExternalLinks,
+}
+
+impl SeoIssue {
+    fn label(self) -> &'static str {
+        match self {
+            SeoIssue::NotRetrieved => "not_retrieved",
+            SeoIssue::Http4xx => "status_4xx",
+            SeoIssue::Http5xx => "status_5xx",
+            SeoIssue::Noindex => "noindex",
+            SeoIssue::MissingTitle => "missing_title",
+            SeoIssue::TitleTooShort => "title_too_short",
+            SeoIssue::TitleTooLong => "title_too_long",
+            SeoIssue::MissingMetaDescription => "missing_meta_description",
+            SeoIssue::MetaDescriptionTooShort => "meta_description_too_short",
+            SeoIssue::MetaDescriptionTooLong => "meta_description_too_long",
+            SeoIssue::MissingH1 => "missing_h1",
+            SeoIssue::MultipleH1 => "multiple_h1",
+            SeoIssue::MissingCanonical => "missing_canonical",
+            SeoIssue::LowWordCount => "low_word_count",
+            SeoIssue::ImagesMissingAlt => "images_missing_alt",
+            SeoIssue::TooManyExternalLinks => "too_many_external_links",
+        }
+    }
+
+    fn penalty(self) -> u8 {
+        match self {
+            SeoIssue::NotRetrieved => 70,
+            SeoIssue::Http5xx => 65,
+            SeoIssue::Http4xx => 40,
+            SeoIssue::Noindex => 20,
+            SeoIssue::MissingTitle => 25,
+            SeoIssue::TitleTooShort => 10,
+            SeoIssue::TitleTooLong => 8,
+            SeoIssue::MissingMetaDescription => 20,
+            SeoIssue::MetaDescriptionTooShort => 8,
+            SeoIssue::MetaDescriptionTooLong => 8,
+            SeoIssue::MissingH1 => 14,
+            SeoIssue::MultipleH1 => 8,
+            SeoIssue::MissingCanonical => 10,
+            SeoIssue::LowWordCount => 10,
+            SeoIssue::ImagesMissingAlt => 8,
+            SeoIssue::TooManyExternalLinks => 6,
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "not_retrieved" => Some(SeoIssue::NotRetrieved),
+            "status_4xx" => Some(SeoIssue::Http4xx),
+            "status_5xx" => Some(SeoIssue::Http5xx),
+            "noindex" => Some(SeoIssue::Noindex),
+            "missing_title" => Some(SeoIssue::MissingTitle),
+            "title_too_short" => Some(SeoIssue::TitleTooShort),
+            "title_too_long" => Some(SeoIssue::TitleTooLong),
+            "missing_meta_description" => Some(SeoIssue::MissingMetaDescription),
+            "meta_description_too_short" => Some(SeoIssue::MetaDescriptionTooShort),
+            "meta_description_too_long" => Some(SeoIssue::MetaDescriptionTooLong),
+            "missing_h1" => Some(SeoIssue::MissingH1),
+            "multiple_h1" => Some(SeoIssue::MultipleH1),
+            "missing_canonical" => Some(SeoIssue::MissingCanonical),
+            "low_word_count" => Some(SeoIssue::LowWordCount),
+            "images_missing_alt" => Some(SeoIssue::ImagesMissingAlt),
+            "too_many_external_links" => Some(SeoIssue::TooManyExternalLinks),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivePanel {
+    Pages,
+    Issues,
+    Summary,
+}
+
+impl ActivePanel {
+    fn as_index(self) -> usize {
+        match self {
+            ActivePanel::Pages => 0,
+            ActivePanel::Issues => 1,
+            ActivePanel::Summary => 2,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            ActivePanel::Pages => "Pages",
+            ActivePanel::Issues => "Issues",
+            ActivePanel::Summary => "Summary",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageSortMode {
+    Latest,
+    LowestSeoScore,
+    HighestResponseTime,
+}
+
+impl PageSortMode {
+    fn cycle(self) -> Self {
+        match self {
+            PageSortMode::Latest => PageSortMode::LowestSeoScore,
+            PageSortMode::LowestSeoScore => PageSortMode::HighestResponseTime,
+            PageSortMode::HighestResponseTime => PageSortMode::Latest,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            PageSortMode::Latest => "latest",
+            PageSortMode::LowestSeoScore => "seo_score",
+            PageSortMode::HighestResponseTime => "response_time",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum DataFormat {
+    Csv,
+    Json,
+}
+
+impl From<FileFormatArg> for DataFormat {
+    fn from(value: FileFormatArg) -> Self {
+        match value {
+            FileFormatArg::Csv => DataFormat::Csv,
+            FileFormatArg::Json => DataFormat::Json,
+        }
+    }
+}
+
+impl SortDirection {
+    fn toggle(self) -> Self {
+        match self {
+            SortDirection::Asc => SortDirection::Desc,
+            SortDirection::Desc => SortDirection::Asc,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SortDirection::Asc => "asc",
+            SortDirection::Desc => "desc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagesPane {
+    Table,
+    Details,
+}
+
+impl PagesPane {
+    fn cycle(self) -> Self {
+        match self {
+            PagesPane::Table => PagesPane::Details,
+            PagesPane::Details => PagesPane::Table,
+        }
+    }
+
+    fn reverse_cycle(self) -> Self {
+        self.cycle()
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PagesPane::Table => "table",
+            PagesPane::Details => "details",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssuesPane {
+    Distribution,
+    Urls,
+}
+
+impl IssuesPane {
+    fn cycle(self) -> Self {
+        match self {
+            IssuesPane::Distribution => IssuesPane::Urls,
+            IssuesPane::Urls => IssuesPane::Distribution,
+        }
+    }
+
+    fn reverse_cycle(self) -> Self {
+        self.cycle()
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            IssuesPane::Distribution => "distribution",
+            IssuesPane::Urls => "urls",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -165,24 +421,66 @@ enum CrawlEvent {
 struct AppState {
     parsed: usize,
     discovered_targets: usize,
+    all_rows: Vec<CrawlRow>,
     rows: VecDeque<CrawlRow>,
     seen: HashSet<String>,
     discovered_seen: HashSet<String>,
+    incoming_links: HashMap<String, HashSet<String>>,
+    outgoing_links: HashMap<String, Vec<String>>,
     done: bool,
     errors: VecDeque<String>,
     status_counts: HashMap<u16, usize>,
+    issue_counts: HashMap<SeoIssue, usize>,
+    title_counts: HashMap<String, usize>,
+    meta_counts: HashMap<String, usize>,
 }
 
 impl AppState {
     fn push_row(&mut self, row: CrawlRow, discovered_links: Vec<String>) -> bool {
+        let mut dedup_outgoing_seen = HashSet::new();
+        let dedup_outgoing = discovered_links
+            .iter()
+            .filter_map(|link| {
+                if dedup_outgoing_seen.insert(link.clone()) {
+                    Some(link.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for link in &discovered_links {
+            if link != &row.url {
+                self.incoming_links
+                    .entry(link.clone())
+                    .or_default()
+                    .insert(row.url.clone());
+            }
+        }
         for link in discovered_links {
             self.discovered_seen.insert(link);
         }
 
         let inserted = self.seen.insert(row.url.clone());
         if inserted {
+            self.outgoing_links.insert(row.url.clone(), dedup_outgoing);
             *self.status_counts.entry(row.status).or_insert(0) += 1;
+            for issue in &row.issues {
+                *self.issue_counts.entry(*issue).or_insert(0) += 1;
+            }
+            if !row.title.is_empty() {
+                *self
+                    .title_counts
+                    .entry(row.title.trim().to_ascii_lowercase())
+                    .or_insert(0) += 1;
+            }
+            if !row.meta.is_empty() && row.retrieval_status == "retrieved" {
+                *self
+                    .meta_counts
+                    .entry(row.meta.trim().to_ascii_lowercase())
+                    .or_insert(0) += 1;
+            }
             self.parsed += 1;
+            self.all_rows.push(row.clone());
             self.rows.push_front(row);
             while self.rows.len() > 500 {
                 self.rows.pop_back();
@@ -198,6 +496,628 @@ impl AppState {
             self.errors.pop_back();
         }
     }
+
+    fn discovered_total(&self) -> usize {
+        self.discovered_targets
+            .max(self.discovered_seen.len())
+            .max(self.parsed)
+    }
+
+    fn average_seo_score(&self) -> u8 {
+        let mut sum = 0u64;
+        let mut count = 0u64;
+        for row in &self.all_rows {
+            if row.retrieval_status == "retrieved" {
+                sum += row.seo_score as u64;
+                count += 1;
+            }
+        }
+        if count == 0 { 0 } else { (sum / count) as u8 }
+    }
+
+    fn duplicate_title_pages(&self) -> usize {
+        self.title_counts
+            .values()
+            .filter(|count| **count > 1)
+            .map(|count| *count)
+            .sum()
+    }
+
+    fn duplicate_meta_pages(&self) -> usize {
+        self.meta_counts
+            .values()
+            .filter(|count| **count > 1)
+            .map(|count| *count)
+            .sum()
+    }
+
+    fn top_issues(&self, limit: usize) -> Vec<(SeoIssue, usize)> {
+        let mut entries = self
+            .issue_counts
+            .iter()
+            .map(|(issue, count)| (*issue, *count))
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.label().cmp(b.0.label())));
+        entries.into_iter().take(limit.max(1)).collect()
+    }
+
+    fn incoming_sources(&self, url: &str, limit: usize) -> Vec<String> {
+        let mut sources = self
+            .incoming_links
+            .get(url)
+            .map(|set| set.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        sources.sort();
+        sources.into_iter().take(limit.max(1)).collect()
+    }
+
+    fn incoming_count(&self, url: &str) -> usize {
+        self.incoming_links
+            .get(url)
+            .map(|set| set.len())
+            .unwrap_or(0)
+    }
+
+    fn filtered_rows_sorted<'a>(
+        &'a self,
+        filter: &str,
+        sort: PageSortMode,
+        direction: SortDirection,
+        limit: usize,
+    ) -> Vec<&'a CrawlRow> {
+        let filter = filter.trim().to_ascii_lowercase();
+        let mut rows = self
+            .all_rows
+            .iter()
+            .rev()
+            .filter(|row| {
+                if filter.is_empty() {
+                    true
+                } else {
+                    row.url.to_ascii_lowercase().contains(&filter)
+                        || row.title.to_ascii_lowercase().contains(&filter)
+                        || row.meta.to_ascii_lowercase().contains(&filter)
+                        || row
+                            .issues
+                            .iter()
+                            .any(|issue| issue.label().contains(&filter))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        match sort {
+            PageSortMode::Latest => {
+                if direction == SortDirection::Asc {
+                    rows.reverse();
+                }
+            }
+            PageSortMode::LowestSeoScore => {
+                rows.sort_by(|a, b| a.seo_score.cmp(&b.seo_score).then(a.url.cmp(&b.url)));
+                if direction == SortDirection::Desc {
+                    rows.reverse();
+                }
+            }
+            PageSortMode::HighestResponseTime => {
+                rows.sort_by(|a, b| {
+                    a.response_time
+                        .cmp(&b.response_time)
+                        .then_with(|| a.url.cmp(&b.url))
+                });
+                if direction == SortDirection::Desc {
+                    rows.reverse();
+                }
+            }
+        }
+
+        rows.into_iter().take(limit.max(1)).collect()
+    }
+}
+
+const CSV_HEADERS: [&str; 31] = [
+    "url",
+    "status",
+    "mime",
+    "retrieval_status",
+    "indexability",
+    "title",
+    "title_length",
+    "meta",
+    "meta_length",
+    "h1",
+    "canonical",
+    "word_count",
+    "size",
+    "response_time_ms",
+    "last_modified",
+    "redirect_url",
+    "redirect_type",
+    "link_count",
+    "internal_link_count",
+    "external_link_count",
+    "h1_count",
+    "h2_count",
+    "image_count",
+    "image_missing_alt_count",
+    "structured_data_count",
+    "seo_score",
+    "issue_count",
+    "issues",
+    "outgoing_links",
+    "crawl_timestamp",
+    "crawl_quality_bucket",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExportRecord {
+    url: String,
+    status: u16,
+    mime: String,
+    retrieval_status: String,
+    indexability: String,
+    title: String,
+    title_length: usize,
+    meta: String,
+    meta_length: usize,
+    h1: String,
+    canonical: String,
+    word_count: usize,
+    size: usize,
+    response_time_ms: u128,
+    last_modified: String,
+    redirect_url: String,
+    redirect_type: String,
+    link_count: usize,
+    internal_link_count: usize,
+    external_link_count: usize,
+    h1_count: usize,
+    h2_count: usize,
+    image_count: usize,
+    image_missing_alt_count: usize,
+    structured_data_count: usize,
+    seo_score: u8,
+    issue_count: usize,
+    issues: String,
+    outgoing_links: Vec<String>,
+    crawl_timestamp: String,
+    crawl_quality_bucket: String,
+}
+
+fn crawl_quality_bucket(seo_score: u8) -> &'static str {
+    match seo_score {
+        85..=100 => "excellent",
+        70..=84 => "good",
+        50..=69 => "warning",
+        _ => "critical",
+    }
+}
+
+fn row_to_export_record(row: &CrawlRow, outgoing_links: &[String]) -> ExportRecord {
+    ExportRecord {
+        url: row.url.clone(),
+        status: row.status,
+        mime: row.mime.clone(),
+        retrieval_status: row.retrieval_status.clone(),
+        indexability: row.indexability.clone(),
+        title: row.title.clone(),
+        title_length: row.title_length,
+        meta: row.meta.clone(),
+        meta_length: row.meta_length,
+        h1: row.h1.clone(),
+        canonical: row.canonical.clone(),
+        word_count: row.word_count,
+        size: row.size,
+        response_time_ms: row.response_time,
+        last_modified: row.last_modified.clone(),
+        redirect_url: row.redirect_url.clone(),
+        redirect_type: row.redirect_type.clone(),
+        link_count: row.link_count,
+        internal_link_count: row.internal_link_count,
+        external_link_count: row.external_link_count,
+        h1_count: row.h1_count,
+        h2_count: row.h2_count,
+        image_count: row.image_count,
+        image_missing_alt_count: row.image_missing_alt_count,
+        structured_data_count: row.structured_data_count,
+        seo_score: row.seo_score,
+        issue_count: row.issues.len(),
+        issues: issues_to_csv(&row.issues),
+        outgoing_links: outgoing_links.to_vec(),
+        crawl_timestamp: row.crawl_timestamp.clone(),
+        crawl_quality_bucket: crawl_quality_bucket(row.seo_score).to_string(),
+    }
+}
+
+fn export_record_to_row(record: ExportRecord) -> (CrawlRow, Vec<String>) {
+    let mut issues = record
+        .issues
+        .split('|')
+        .filter_map(SeoIssue::from_label)
+        .collect::<Vec<_>>();
+    if issues.is_empty() && record.retrieval_status == "not_retrieved" {
+        issues.push(SeoIssue::NotRetrieved);
+    }
+
+    (
+        CrawlRow {
+            url: record.url,
+            status: record.status,
+            mime: record.mime,
+            retrieval_status: record.retrieval_status,
+            indexability: record.indexability,
+            title: record.title,
+            title_length: record.title_length,
+            meta: record.meta,
+            meta_length: record.meta_length,
+            h1: record.h1,
+            canonical: record.canonical,
+            word_count: record.word_count,
+            size: record.size,
+            response_time: record.response_time_ms,
+            last_modified: record.last_modified,
+            redirect_url: record.redirect_url,
+            redirect_type: record.redirect_type,
+            link_count: record.link_count,
+            internal_link_count: record.internal_link_count,
+            external_link_count: record.external_link_count,
+            h1_count: record.h1_count,
+            h2_count: record.h2_count,
+            image_count: record.image_count,
+            image_missing_alt_count: record.image_missing_alt_count,
+            structured_data_count: record.structured_data_count,
+            seo_score: if record.seo_score == 0 && !issues.is_empty() {
+                compute_seo_score(&issues)
+            } else {
+                record.seo_score
+            },
+            issues,
+            crawl_timestamp: record.crawl_timestamp,
+        },
+        record.outgoing_links,
+    )
+}
+
+struct CsvSink {
+    writer: csv::Writer<File>,
+}
+
+impl CsvSink {
+    fn new(output_path: &str) -> io::Result<Self> {
+        let file = File::create(output_path)?;
+        let mut writer = csv::Writer::from_writer(file);
+        writer.write_record(CSV_HEADERS)?;
+        Ok(Self { writer })
+    }
+
+    fn write_row(&mut self, row: &CrawlRow, outgoing_links: &[String]) -> io::Result<()> {
+        let rec = row_to_export_record(row, outgoing_links);
+        self.writer.write_record([
+            rec.url,
+            rec.status.to_string(),
+            rec.mime,
+            rec.retrieval_status,
+            rec.indexability,
+            rec.title,
+            rec.title_length.to_string(),
+            rec.meta,
+            rec.meta_length.to_string(),
+            rec.h1,
+            rec.canonical,
+            rec.word_count.to_string(),
+            rec.size.to_string(),
+            rec.response_time_ms.to_string(),
+            rec.last_modified,
+            rec.redirect_url,
+            rec.redirect_type,
+            rec.link_count.to_string(),
+            rec.internal_link_count.to_string(),
+            rec.external_link_count.to_string(),
+            rec.h1_count.to_string(),
+            rec.h2_count.to_string(),
+            rec.image_count.to_string(),
+            rec.image_missing_alt_count.to_string(),
+            rec.structured_data_count.to_string(),
+            rec.seo_score.to_string(),
+            rec.issue_count.to_string(),
+            rec.issues,
+            rec.outgoing_links.join("|"),
+            rec.crawl_timestamp,
+            rec.crawl_quality_bucket,
+        ])?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+struct JsonSink {
+    file: File,
+    first: bool,
+    closed: bool,
+}
+
+impl JsonSink {
+    fn new(output_path: &str) -> io::Result<Self> {
+        let mut file = File::create(output_path)?;
+        file.write_all(b"[\n")?;
+        Ok(Self {
+            file,
+            first: true,
+            closed: false,
+        })
+    }
+
+    fn write_row(&mut self, row: &CrawlRow, outgoing_links: &[String]) -> io::Result<()> {
+        let rec = row_to_export_record(row, outgoing_links);
+        if !self.first {
+            self.file.write_all(b",\n")?;
+        }
+        self.first = false;
+        serde_json::to_writer(&mut self.file, &rec).map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+
+    fn finalize(&mut self) -> io::Result<()> {
+        if !self.closed {
+            if self.first {
+                self.file.write_all(b"]\n")?;
+            } else {
+                self.file.write_all(b"\n]\n")?;
+            }
+            self.closed = true;
+        }
+        self.file.flush()
+    }
+}
+
+impl Drop for JsonSink {
+    fn drop(&mut self) {
+        let _ = self.finalize();
+    }
+}
+
+enum OutputSink {
+    Csv(CsvSink),
+    Json(JsonSink),
+}
+
+impl OutputSink {
+    fn new(output_path: &str, format: DataFormat) -> io::Result<Self> {
+        match format {
+            DataFormat::Csv => Ok(OutputSink::Csv(CsvSink::new(output_path)?)),
+            DataFormat::Json => Ok(OutputSink::Json(JsonSink::new(output_path)?)),
+        }
+    }
+
+    fn write_row(&mut self, row: &CrawlRow, outgoing_links: &[String]) -> io::Result<()> {
+        match self {
+            OutputSink::Csv(sink) => sink.write_row(row, outgoing_links),
+            OutputSink::Json(sink) => sink.write_row(row, outgoing_links),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            OutputSink::Csv(sink) => sink.flush(),
+            OutputSink::Json(sink) => sink.flush(),
+        }
+    }
+
+    fn finalize(&mut self) -> io::Result<()> {
+        match self {
+            OutputSink::Csv(sink) => sink.flush(),
+            OutputSink::Json(sink) => sink.finalize(),
+        }
+    }
+}
+
+fn issues_to_csv(issues: &[SeoIssue]) -> String {
+    issues
+        .iter()
+        .map(|issue| issue.label())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn load_rows_from_csv(path: &str) -> io::Result<Vec<(CrawlRow, Vec<String>)>> {
+    let mut reader = csv::Reader::from_path(path)?;
+    let headers = reader.headers()?.clone();
+    let mut index = HashMap::<String, usize>::new();
+    for (idx, header) in headers.iter().enumerate() {
+        index.insert(header.trim().to_ascii_lowercase(), idx);
+    }
+
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        let record = record?;
+        let get = |names: &[&str]| -> String {
+            for name in names {
+                if let Some(idx) = index.get(&name.to_ascii_lowercase())
+                    && let Some(value) = record.get(*idx)
+                {
+                    return value.to_string();
+                }
+            }
+            String::new()
+        };
+
+        let url = get(&["url"]);
+        if url.trim().is_empty() {
+            continue;
+        }
+        let status = get(&["status"]).parse::<u16>().unwrap_or(0);
+        let retrieval_status = get(&["retrieval_status"]);
+        let title = get(&["title"]);
+        let meta = get(&["meta"]);
+        let h1 = get(&["h1"]);
+        let canonical = get(&["canonical"]);
+        let issues_raw = get(&["issues"]);
+        let rec = ExportRecord {
+            url,
+            status,
+            mime: get(&["mime"]),
+            retrieval_status: if retrieval_status.is_empty() {
+                if status == 0 {
+                    "not_retrieved".to_string()
+                } else {
+                    "retrieved".to_string()
+                }
+            } else {
+                retrieval_status
+            },
+            indexability: get(&["indexability"]),
+            title_length: get(&["title_length"])
+                .parse::<usize>()
+                .unwrap_or(title.chars().count()),
+            title,
+            meta_length: get(&["meta_length"])
+                .parse::<usize>()
+                .unwrap_or(meta.chars().count()),
+            meta,
+            h1,
+            canonical,
+            word_count: get(&["word_count", "word count"])
+                .parse::<usize>()
+                .unwrap_or(0),
+            size: get(&["size"]).parse::<usize>().unwrap_or(0),
+            response_time_ms: get(&["response_time_ms", "response_time"])
+                .parse::<u128>()
+                .unwrap_or(0),
+            last_modified: get(&["last_modified"]),
+            redirect_url: get(&["redirect_url", "redirect url"]),
+            redirect_type: get(&["redirect_type", "redirect type"]),
+            link_count: get(&["link_count", "link count"])
+                .parse::<usize>()
+                .unwrap_or(0),
+            internal_link_count: get(&["internal_link_count"]).parse::<usize>().unwrap_or(0),
+            external_link_count: get(&["external_link_count"]).parse::<usize>().unwrap_or(0),
+            h1_count: get(&["h1_count"]).parse::<usize>().unwrap_or(0),
+            h2_count: get(&["h2_count"]).parse::<usize>().unwrap_or(0),
+            image_count: get(&["image_count"]).parse::<usize>().unwrap_or(0),
+            image_missing_alt_count: get(&["image_missing_alt_count"])
+                .parse::<usize>()
+                .unwrap_or(0),
+            structured_data_count: get(&["structured_data_count"])
+                .parse::<usize>()
+                .unwrap_or(0),
+            seo_score: get(&["seo_score"]).parse::<u8>().unwrap_or(0),
+            issue_count: get(&["issue_count"]).parse::<usize>().unwrap_or(0),
+            issues: issues_raw,
+            outgoing_links: get(&["outgoing_links"])
+                .split('|')
+                .map(str::trim)
+                .filter(|link| !link.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            crawl_timestamp: get(&["crawl_timestamp", "crawl timestamp"]),
+            crawl_quality_bucket: get(&["crawl_quality_bucket"]),
+        };
+        rows.push(export_record_to_row(rec));
+    }
+
+    Ok(rows)
+}
+
+fn load_rows_from_json(path: &str) -> io::Result<Vec<(CrawlRow, Vec<String>)>> {
+    let content = fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Ok(records) = serde_json::from_str::<Vec<ExportRecord>>(&content) {
+        return Ok(records.into_iter().map(export_record_to_row).collect());
+    }
+
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<ExportRecord>(line)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        out.push(export_record_to_row(record));
+    }
+    Ok(out)
+}
+
+fn detect_data_format(path: &str, fallback: DataFormat) -> DataFormat {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".json") {
+        DataFormat::Json
+    } else if lower.ends_with(".csv") {
+        DataFormat::Csv
+    } else {
+        fallback
+    }
+}
+
+fn load_rows_from_file(path: &str) -> io::Result<Vec<(CrawlRow, Vec<String>)>> {
+    match detect_data_format(path, DataFormat::Csv) {
+        DataFormat::Csv => load_rows_from_csv(path),
+        DataFormat::Json => load_rows_from_json(path),
+    }
+}
+
+fn default_output_path(url: &str, format: DataFormat) -> String {
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| "crawl".to_string());
+    let host = host
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let ts = Utc::now().format("%Y%m%d_%H%M%S");
+    match format {
+        DataFormat::Csv => format!("{host}_{ts}.csv"),
+        DataFormat::Json => format!("{host}_{ts}.json"),
+    }
+}
+
+fn handle_crawl_event(
+    state: &mut AppState,
+    sink: Option<&mut OutputSink>,
+    event: CrawlEvent,
+) -> io::Result<()> {
+    match event {
+        CrawlEvent::Page {
+            row,
+            discovered_links,
+        } => {
+            if state.push_row(row.clone(), discovered_links.clone()) {
+                if let Some(sink) = sink {
+                    sink.write_row(&row, &discovered_links)?;
+                }
+            }
+        }
+        CrawlEvent::Unretrieved { url, reason } => {
+            let row = unretrieved_row(url, reason);
+            if state.push_row(row.clone(), Vec::new()) {
+                if let Some(sink) = sink {
+                    sink.write_row(&row, &[])?;
+                }
+            }
+        }
+        CrawlEvent::Stats { discovered } => {
+            state.discovered_targets = state.discovered_targets.max(discovered);
+        }
+        CrawlEvent::Finished => state.done = true,
+        CrawlEvent::Error(err) => state.push_error(err),
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -205,14 +1125,50 @@ async fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let auto_close = cli.auto_close;
     let no_tui = cli.no_tui;
-    let (tx, mut rx) = mpsc::unbounded_channel::<CrawlEvent>();
-    let output_path = cli.output.clone();
+    if let Some(review_file) = cli.review_file.clone() {
+        let review_rows = load_rows_from_file(&review_file)?;
+        let (tx, mut rx) = mpsc::unbounded_channel::<CrawlEvent>();
+        for (row, outgoing_links) in review_rows {
+            let _ = tx.send(CrawlEvent::Page {
+                row,
+                discovered_links: outgoing_links,
+            });
+        }
+        let _ = tx.send(CrawlEvent::Finished);
+        drop(tx);
 
+        if no_tui {
+            return run_review_headless(&review_file, &mut rx);
+        }
+        return run_tui(&review_file, None, auto_close, &mut rx);
+    }
+
+    let start_url = cli
+        .url
+        .as_deref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing URL"))?;
+    let configured_format: DataFormat = cli.format.into();
+    let output_format = cli
+        .output
+        .as_deref()
+        .map(|path| detect_data_format(path, configured_format))
+        .unwrap_or(configured_format);
+    let output_path = cli
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output_path(start_url, output_format));
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<CrawlEvent>();
     let crawl_handle = tokio::spawn(run_crawler(cli, tx));
     let tui_result = if no_tui {
-        run_headless(&output_path, &mut rx)
+        run_headless(&output_path, output_format, &mut rx)
     } else {
-        run_tui(&output_path, auto_close, &mut rx)
+        run_tui(
+            &output_path,
+            Some((output_path.as_str(), output_format)),
+            auto_close,
+            &mut rx,
+        )
     };
 
     if let Err(e) = crawl_handle.await {
@@ -222,136 +1178,89 @@ async fn main() -> io::Result<()> {
     tui_result
 }
 
-fn run_headless(output_path: &str, rx: &mut UnboundedReceiver<CrawlEvent>) -> io::Result<()> {
-    let file = File::create(output_path)?;
-    let mut writer = csv::Writer::from_writer(file);
-    writer.write_record([
-        "url",
-        "status",
-        "mime",
-        "retrieval_status",
-        "indexability",
-        "title",
-        "title_length",
-        "meta",
-        "meta_length",
-        "h1",
-        "canonical",
-        "word count",
-        "size",
-        "response_time",
-        "last_modified",
-        "redirect url",
-        "redirect type",
-        "link count",
-        "crawl timestamp",
-    ])?;
-
+fn run_headless(
+    output_path: &str,
+    output_format: DataFormat,
+    rx: &mut UnboundedReceiver<CrawlEvent>,
+) -> io::Result<()> {
+    let mut sink = OutputSink::new(output_path, output_format)?;
     let mut state = AppState::default();
     loop {
         while let Ok(event) = rx.try_recv() {
-            match event {
-                CrawlEvent::Page {
-                    row,
-                    discovered_links,
-                } => {
-                    if state.push_row(row.clone(), discovered_links) {
-                        writer.write_record([
-                            row.url,
-                            row.status.to_string(),
-                            row.mime,
-                            row.retrieval_status,
-                            row.indexability,
-                            row.title,
-                            row.title_length.to_string(),
-                            row.meta,
-                            row.meta_length.to_string(),
-                            row.h1,
-                            row.canonical,
-                            row.word_count.to_string(),
-                            row.size.to_string(),
-                            row.response_time.to_string(),
-                            row.last_modified,
-                            row.redirect_url,
-                            row.redirect_type,
-                            row.link_count.to_string(),
-                            row.crawl_timestamp,
-                        ])?;
-                    }
-                }
-                CrawlEvent::Unretrieved { url, reason } => {
-                    let row = unretrieved_row(url, reason);
-                    if state.push_row(row.clone(), Vec::new()) {
-                        writer.write_record([
-                            row.url,
-                            row.status.to_string(),
-                            row.mime,
-                            row.retrieval_status,
-                            row.indexability,
-                            row.title,
-                            row.title_length.to_string(),
-                            row.meta,
-                            row.meta_length.to_string(),
-                            row.h1,
-                            row.canonical,
-                            row.word_count.to_string(),
-                            row.size.to_string(),
-                            row.response_time.to_string(),
-                            row.last_modified,
-                            row.redirect_url,
-                            row.redirect_type,
-                            row.link_count.to_string(),
-                            row.crawl_timestamp,
-                        ])?;
-                    }
-                }
-                CrawlEvent::Stats { discovered } => {
-                    state.discovered_targets = state.discovered_targets.max(discovered);
-                }
-                CrawlEvent::Finished => state.done = true,
-                CrawlEvent::Error(err) => {
-                    eprintln!("{err}");
-                    state.push_error(err);
-                }
+            if let CrawlEvent::Error(err) = &event {
+                eprintln!("{err}");
             }
+            handle_crawl_event(&mut state, Some(&mut sink), event)?;
         }
 
-        writer.flush()?;
+        sink.flush()?;
         if state.done {
             break;
         }
         std::thread::sleep(Duration::from_millis(120));
     }
 
-    writer.flush()?;
+    sink.finalize()?;
     eprintln!(
-        "finished crawl: parsed={} discovered={} output={}",
+        "finished crawl: parsed={} discovered={} avg_score={} output={}",
         state.parsed,
-        state
-            .discovered_targets
-            .max(state.discovered_seen.len())
-            .max(state.parsed),
+        state.discovered_total(),
+        state.average_seo_score(),
         output_path
     );
     Ok(())
 }
 
+fn run_review_headless(
+    review_path: &str,
+    rx: &mut UnboundedReceiver<CrawlEvent>,
+) -> io::Result<()> {
+    let mut state = AppState::default();
+    loop {
+        while let Ok(event) = rx.try_recv() {
+            if let CrawlEvent::Error(err) = &event {
+                eprintln!("{err}");
+            }
+            handle_crawl_event(&mut state, None, event)?;
+        }
+
+        if state.done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+
+    eprintln!(
+        "loaded review dataset: parsed={} discovered={} avg_score={} input={}",
+        state.parsed,
+        state.discovered_total(),
+        state.average_seo_score(),
+        review_path
+    );
+    Ok(())
+}
+
 fn run_tui(
-    output_path: &str,
+    session_label: &str,
+    output_target: Option<(&str, DataFormat)>,
     auto_close: bool,
     rx: &mut UnboundedReceiver<CrawlEvent>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let tui_result = draw_loop(&mut terminal, output_path, auto_close, rx);
+    let tui_result = draw_loop(&mut terminal, session_label, output_target, auto_close, rx);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     tui_result
@@ -359,128 +1268,99 @@ fn run_tui(
 
 fn draw_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    output_path: &str,
+    session_label_input: &str,
+    output_target: Option<(&str, DataFormat)>,
     auto_close: bool,
     rx: &mut UnboundedReceiver<CrawlEvent>,
 ) -> io::Result<()> {
-    let file = File::create(output_path)?;
-    let mut writer = csv::Writer::from_writer(file);
-    writer.write_record([
-        "url",
-        "status",
-        "mime",
-        "retrieval_status",
-        "indexability",
-        "title",
-        "title_length",
-        "meta",
-        "meta_length",
-        "h1",
-        "canonical",
-        "word count",
-        "size",
-        "response_time",
-        "last_modified",
-        "redirect url",
-        "redirect type",
-        "link count",
-        "crawl timestamp",
-    ])?;
-
+    let mut sink = if let Some((path, format)) = output_target {
+        Some(OutputSink::new(path, format)?)
+    } else {
+        None
+    };
+    let session_label = session_label_input.to_string();
     let mut state = AppState::default();
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(120);
+    let mut active_panel = ActivePanel::Pages;
+    let mut sort_mode = PageSortMode::Latest;
+    let mut sort_direction = SortDirection::Desc;
+    let mut filter = String::new();
+    let mut filter_mode = false;
+    let mut paused = false;
+    let mut selected_page_idx = 0usize;
+    let mut selected_issue_idx = 0usize;
+    let mut selected_issue_page_idx = 0usize;
+    let mut page_table_state = TableState::default();
+    let mut issue_table_state = TableState::default();
+    let mut issue_page_table_state = TableState::default();
+    let mut paused_events = VecDeque::<CrawlEvent>::new();
+    let mut page_table_area: Option<Rect> = None;
+    let mut issue_distribution_area: Option<Rect> = None;
+    let mut issue_urls_area: Option<Rect> = None;
+    let mut page_view_urls: Vec<String> = Vec::new();
+    let mut issue_view_urls: Vec<String> = Vec::new();
+    let mut pages_pane = PagesPane::Table;
+    let mut issues_pane = IssuesPane::Distribution;
+    let mut hovered_page_url_idx: Option<usize> = None;
+    let mut hovered_issue_url_idx: Option<usize> = None;
+    let mut last_page_click: Option<(usize, Instant)> = None;
+    let mut last_issue_url_click: Option<(usize, Instant)> = None;
 
     loop {
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                CrawlEvent::Page {
-                    row,
-                    discovered_links,
-                } => {
-                    if state.push_row(row.clone(), discovered_links) {
-                        writer.write_record([
-                            row.url,
-                            row.status.to_string(),
-                            row.mime,
-                            row.retrieval_status,
-                            row.indexability,
-                            row.title,
-                            row.title_length.to_string(),
-                            row.meta,
-                            row.meta_length.to_string(),
-                            row.h1,
-                            row.canonical,
-                            row.word_count.to_string(),
-                            row.size.to_string(),
-                            row.response_time.to_string(),
-                            row.last_modified,
-                            row.redirect_url,
-                            row.redirect_type,
-                            row.link_count.to_string(),
-                            row.crawl_timestamp,
-                        ])?;
-                    }
-                }
-                CrawlEvent::Unretrieved { url, reason } => {
-                    let row = unretrieved_row(url, reason);
-                    if state.push_row(row.clone(), Vec::new()) {
-                        writer.write_record([
-                            row.url,
-                            row.status.to_string(),
-                            row.mime,
-                            row.retrieval_status,
-                            row.indexability,
-                            row.title,
-                            row.title_length.to_string(),
-                            row.meta,
-                            row.meta_length.to_string(),
-                            row.h1,
-                            row.canonical,
-                            row.word_count.to_string(),
-                            row.size.to_string(),
-                            row.response_time.to_string(),
-                            row.last_modified,
-                            row.redirect_url,
-                            row.redirect_type,
-                            row.link_count.to_string(),
-                            row.crawl_timestamp,
-                        ])?;
-                    }
-                }
-                CrawlEvent::Stats { discovered } => {
-                    state.discovered_targets = state.discovered_targets.max(discovered);
-                }
-                CrawlEvent::Finished => state.done = true,
-                CrawlEvent::Error(err) => state.push_error(err),
+        if !paused {
+            for _ in 0..300 {
+                let Some(event) = paused_events.pop_front() else {
+                    break;
+                };
+                handle_crawl_event(&mut state, sink.as_mut(), event)?;
             }
         }
 
+        while let Ok(event) = rx.try_recv() {
+            if paused
+                && matches!(
+                    event,
+                    CrawlEvent::Page { .. } | CrawlEvent::Unretrieved { .. }
+                )
+            {
+                paused_events.push_back(event);
+                if paused_events.len() > 20_000 {
+                    paused_events.pop_front();
+                }
+                continue;
+            }
+            handle_crawl_event(&mut state, sink.as_mut(), event)?;
+        }
+
         terminal.draw(|f| {
+            page_table_area = None;
+            issue_distribution_area = None;
+            issue_urls_area = None;
+            page_view_urls.clear();
+            issue_view_urls.clear();
+
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(6),
+                    Constraint::Length(5),
                     Constraint::Length(3),
-                    Constraint::Min(10),
-                    Constraint::Length(4),
+                    Constraint::Min(12),
+                    Constraint::Length(5),
                 ])
                 .split(f.area());
 
             let crawl_title = if state.done {
                 if auto_close {
-                    "Spider Crawl - Finished (auto-closing)"
+                    "gh0st Crawl- Finished (auto-closing)"
                 } else {
-                    "Spider Crawl - Finished (press q to quit)"
+                    "gh0st Crawl - Finished (press q to quit)"
                 }
             } else {
-                "Spider Crawl - Running (press q to quit)"
+                "gh0st Crawl - Running (press q to quit)"
             };
 
-            let discovered_total = state
-                .discovered_targets
-                .max(state.discovered_seen.len())
-                .max(state.parsed);
+            let discovered_total = state.discovered_total();
             let remaining = discovered_total.saturating_sub(state.parsed);
             let buckets = status_buckets(&state.status_counts);
             let top_codes = top_status_codes(&state.status_counts, 10);
@@ -522,8 +1402,33 @@ fn draw_loop(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("  |  ", sep_style),
-                    Span::styled("CSV ", metric_label),
-                    Span::styled(output_path.to_string(), Style::default().fg(Color::White)),
+                    Span::styled("Avg SEO ", metric_label),
+                    Span::styled(
+                        state.average_seo_score().to_string(),
+                        seo_score_style(state.average_seo_score()),
+                    ),
+                    Span::styled("  |  ", sep_style),
+                    Span::styled("Dup title ", metric_label),
+                    Span::styled(
+                        state.duplicate_title_pages().to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled("  |  ", sep_style),
+                    Span::styled("Dup meta ", metric_label),
+                    Span::styled(
+                        state.duplicate_meta_pages().to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled("  |  ", sep_style),
+                    Span::styled(
+                        if output_target.is_some() {
+                            "CSV "
+                        } else {
+                            "Dataset "
+                        },
+                        metric_label,
+                    ),
+                    Span::styled(session_label.clone(), Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
                     Span::styled("Buckets  ", metric_label),
@@ -592,6 +1497,38 @@ fn draw_loop(
             } else {
                 state.parsed as f64 / discovered_total as f64
             };
+            let controls = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(24), Constraint::Min(20)])
+                .split(chunks[1]);
+
+            let hotkey_style = Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD);
+            let tab_label_style = Style::default().fg(Color::Gray);
+            let tabs = Tabs::new(vec![
+                Line::from(vec![
+                    Span::styled("P", hotkey_style),
+                    Span::styled(" Pages", tab_label_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("I", hotkey_style),
+                    Span::styled(" Issues", tab_label_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("S", hotkey_style),
+                    Span::styled(" Summary", tab_label_style),
+                ]),
+            ])
+            .select(active_panel.as_index())
+            .block(Block::default().title("Panel").borders(Borders::ALL))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+            f.render_widget(tabs, controls[0]);
+
             let gauge = Gauge::default()
                 .block(Block::default().title("Progress").borders(Borders::ALL))
                 .gauge_style(
@@ -601,68 +1538,784 @@ fn draw_loop(
                         .add_modifier(Modifier::BOLD),
                 )
                 .ratio(ratio.clamp(0.0, 1.0))
-                .label(format!("{:.1}%", ratio * 100.0));
-            f.render_widget(gauge, chunks[1]);
+                .label(format!(
+                    "{:.1}% | quality {} | {}{}",
+                    ratio * 100.0,
+                    state.average_seo_score(),
+                    if paused { "paused" } else { "live" },
+                    if paused_events.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (buffered {})", paused_events.len())
+                    }
+                ));
+            f.render_widget(gauge, controls[1]);
 
-            let rows = state.rows.iter().take(200).map(|r| {
-                let status_style = if r.status >= 400 {
-                    Style::default().fg(Color::Red)
-                } else if r.status >= 300 {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Green)
-                };
+            match active_panel {
+                ActivePanel::Pages => {
+                    let panel_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+                        .split(chunks[2]);
 
-                Row::new(vec![
-                    Cell::from(r.status.to_string()).style(status_style),
-                    Cell::from(r.mime.clone()),
-                    Cell::from(r.title.clone()),
-                    Cell::from(r.url.clone()),
-                ])
-            });
+                    let page_rows =
+                        state.filtered_rows_sorted(&filter, sort_mode, sort_direction, 400);
+                    page_view_urls = page_rows.iter().map(|row| row.url.clone()).collect();
+                    if page_rows.is_empty() {
+                        selected_page_idx = 0;
+                        page_table_state.select(None);
+                    } else {
+                        selected_page_idx = selected_page_idx.min(page_rows.len() - 1);
+                        page_table_state.select(Some(selected_page_idx));
+                    }
 
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(8),
-                    Constraint::Length(18),
-                    Constraint::Length(36),
-                    Constraint::Min(20),
-                ],
-            )
-            .header(
-                Row::new(vec!["Status", "Mime", "Title", "URL"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-            )
-            .block(Block::default().title("Latest Pages").borders(Borders::ALL))
-            .column_spacing(1);
-            f.render_widget(table, chunks[2]);
+                    let rows = page_rows.iter().enumerate().map(|(idx, r)| {
+                        let url_style = if hovered_page_url_idx == Some(idx) {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            Style::default()
+                        };
+                        Row::new(vec![
+                            Cell::from(r.status.to_string()).style(status_code_style(r.status)),
+                            Cell::from(r.seo_score.to_string()).style(seo_score_style(r.seo_score)),
+                            Cell::from(r.response_time.to_string()),
+                            Cell::from(r.title.clone()),
+                            Cell::from(r.url.clone()).style(url_style),
+                        ])
+                    });
+                    let pages_table = Table::new(
+                        rows,
+                        [
+                            Constraint::Length(8),
+                            Constraint::Length(6),
+                            Constraint::Length(9),
+                            Constraint::Length(34),
+                            Constraint::Min(20),
+                        ],
+                    )
+                    .header(
+                        Row::new(vec!["Status", "SEO", "RT(ms)", "Title", "URL"])
+                            .style(Style::default().add_modifier(Modifier::BOLD)),
+                    )
+                    .row_highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .block(
+                        Block::default()
+                            .title(format!("Pages ({})", page_rows.len()))
+                            .borders(Borders::ALL)
+                            .border_style(if pages_pane == PagesPane::Table {
+                                Style::default().fg(Color::Cyan)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
+                            }),
+                    )
+                    .column_spacing(1);
+                    page_table_area = Some(panel_chunks[0]);
+                    f.render_stateful_widget(pages_table, panel_chunks[0], &mut page_table_state);
 
-            let errors = if state.errors.is_empty() {
-                "No errors".to_string()
+                    let detail = if let Some(row) = page_rows.get(selected_page_idx) {
+                        let issues = if row.issues.is_empty() {
+                            "none".to_string()
+                        } else {
+                            row.issues
+                                .iter()
+                                .map(|i| i.label())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        let incoming = state.incoming_sources(&row.url, 5);
+                        let incoming_count = state.incoming_count(&row.url);
+                        let incoming_preview = if incoming.is_empty() {
+                            "none".to_string()
+                        } else {
+                            incoming.join(" | ")
+                        };
+                        vec![
+                            Line::from(format!("URL: {}", row.url)),
+                            Line::from(format!("Title: {}", row.title)),
+                            Line::from(format!(
+                                "SEO score: {} | Status: {} | Indexability: {}",
+                                row.seo_score, row.status, row.indexability
+                            )),
+                            Line::from(format!(
+                                "H1/H2: {}/{} | Words: {} | Images: {} (missing alt {})",
+                                row.h1_count,
+                                row.h2_count,
+                                row.word_count,
+                                row.image_count,
+                                row.image_missing_alt_count
+                            )),
+                            Line::from(format!(
+                                "Links: {} (internal {} / external {})",
+                                row.link_count, row.internal_link_count, row.external_link_count
+                            )),
+                            Line::from(format!(
+                                "Incoming refs: {}{}",
+                                incoming_count,
+                                if row.status == 404 {
+                                    " (check these for 404 source)"
+                                } else {
+                                    ""
+                                }
+                            )),
+                            Line::from(format!("Referrers: {}", incoming_preview)),
+                            Line::from(format!(
+                                "Structured data blocks: {}",
+                                row.structured_data_count
+                            )),
+                            Line::from(format!("Issues: {}", issues)),
+                        ]
+                    } else {
+                        vec![Line::from("No pages match the current filter")]
+                    };
+                    let details = Paragraph::new(detail)
+                        .block(
+                            Block::default()
+                                .title("Selected Page")
+                                .borders(Borders::ALL)
+                                .border_style(if pages_pane == PagesPane::Details {
+                                    Style::default().fg(Color::Cyan)
+                                } else {
+                                    Style::default().fg(Color::DarkGray)
+                                }),
+                        )
+                        .wrap(Wrap { trim: true });
+                    f.render_widget(details, panel_chunks[1]);
+                }
+                ActivePanel::Issues => {
+                    let panel_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                        .split(chunks[2]);
+
+                    let mut issue_nav_entries: Vec<(String, usize, Option<SeoIssue>)> = vec![(
+                        "Most Problematic Pages".to_string(),
+                        state
+                            .all_rows
+                            .iter()
+                            .filter(|row| !row.issues.is_empty())
+                            .count(),
+                        None,
+                    )];
+                    issue_nav_entries.extend(
+                        state
+                            .top_issues(30)
+                            .into_iter()
+                            .map(|(issue, count)| (issue.label().to_string(), count, Some(issue))),
+                    );
+
+                    selected_issue_idx = selected_issue_idx.min(issue_nav_entries.len() - 1);
+                    issue_table_state.select(Some(selected_issue_idx));
+
+                    let rows = issue_nav_entries.iter().map(|(label, count, issue)| {
+                        let style = if issue.is_none() {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        Row::new(vec![
+                            Cell::from(label.clone()).style(style),
+                            Cell::from(count.to_string()),
+                        ])
+                    });
+                    let issues_table =
+                        Table::new(rows, [Constraint::Min(22), Constraint::Length(10)])
+                            .header(
+                                Row::new(vec!["Issue", "Pages"])
+                                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                            )
+                            .row_highlight_style(
+                                Style::default()
+                                    .bg(Color::DarkGray)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                            .block(
+                                Block::default()
+                                    .title("Issue Distribution")
+                                    .borders(Borders::ALL)
+                                    .border_style(if issues_pane == IssuesPane::Distribution {
+                                        Style::default().fg(Color::Cyan)
+                                    } else {
+                                        Style::default().fg(Color::DarkGray)
+                                    }),
+                            )
+                            .column_spacing(1);
+                    issue_distribution_area = Some(panel_chunks[0]);
+                    f.render_stateful_widget(issues_table, panel_chunks[0], &mut issue_table_state);
+
+                    let selected_issue = issue_nav_entries
+                        .get(selected_issue_idx)
+                        .and_then(|(_, _, issue)| *issue);
+                    let mut filtered_pages = state
+                        .all_rows
+                        .iter()
+                        .filter(|row| match selected_issue {
+                            Some(issue) => row.issues.contains(&issue),
+                            None => true,
+                        })
+                        .collect::<Vec<_>>();
+                    filtered_pages.sort_by(|a, b| {
+                        b.issues
+                            .len()
+                            .cmp(&a.issues.len())
+                            .then(a.seo_score.cmp(&b.seo_score))
+                            .then_with(|| a.url.cmp(&b.url))
+                    });
+                    issue_view_urls = filtered_pages
+                        .iter()
+                        .take(100)
+                        .map(|row| row.url.clone())
+                        .collect::<Vec<_>>();
+                    if issue_view_urls.is_empty() {
+                        selected_issue_page_idx = 0;
+                        issue_page_table_state.select(None);
+                    } else {
+                        selected_issue_page_idx =
+                            selected_issue_page_idx.min(issue_view_urls.len() - 1);
+                        issue_page_table_state.select(Some(selected_issue_page_idx));
+                    }
+
+                    let rows = filtered_pages
+                        .iter()
+                        .take(100)
+                        .enumerate()
+                        .map(|(idx, row)| {
+                            let url_style = if hovered_issue_url_idx == Some(idx) {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::UNDERLINED)
+                            } else {
+                                Style::default()
+                            };
+                            Row::new(vec![
+                                Cell::from(row.seo_score.to_string())
+                                    .style(seo_score_style(row.seo_score)),
+                                Cell::from(row.issues.len().to_string()),
+                                Cell::from(row.status.to_string())
+                                    .style(status_code_style(row.status)),
+                                Cell::from(state.incoming_count(&row.url).to_string()),
+                                Cell::from(row.url.clone()).style(url_style),
+                            ])
+                        });
+                    let table = Table::new(
+                        rows,
+                        [
+                            Constraint::Length(8),
+                            Constraint::Length(8),
+                            Constraint::Length(8),
+                            Constraint::Length(8),
+                            Constraint::Min(20),
+                        ],
+                    )
+                    .header(
+                        Row::new(vec!["SEO", "Issues", "Status", "In", "URL"])
+                            .style(Style::default().add_modifier(Modifier::BOLD)),
+                    )
+                    .row_highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .block(
+                        Block::default()
+                            .title(match selected_issue {
+                                Some(issue) => format!(
+                                    "Filtered Pages for '{}' ({})",
+                                    issue.label(),
+                                    filtered_pages.len()
+                                ),
+                                None => {
+                                    format!("Most Problematic Pages ({})", filtered_pages.len())
+                                }
+                            })
+                            .borders(Borders::ALL)
+                            .border_style(if issues_pane == IssuesPane::Urls {
+                                Style::default().fg(Color::Cyan)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
+                            }),
+                    )
+                    .column_spacing(1);
+                    issue_urls_area = Some(panel_chunks[1]);
+                    f.render_stateful_widget(table, panel_chunks[1], &mut issue_page_table_state);
+                }
+                ActivePanel::Summary => {
+                    let top_issues = state
+                        .top_issues(8)
+                        .into_iter()
+                        .map(|(issue, count)| format!("{}: {}", issue.label(), count))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let summary_lines = vec![
+                        Line::from(format!("Pages parsed: {}", state.parsed)),
+                        Line::from(format!("Discovered crawl targets: {}", discovered_total)),
+                        Line::from(format!("Average SEO score: {}", state.average_seo_score())),
+                        Line::from(format!(
+                            "Duplicate title pages: {}",
+                            state.duplicate_title_pages()
+                        )),
+                        Line::from(format!(
+                            "Duplicate meta description pages: {}",
+                            state.duplicate_meta_pages()
+                        )),
+                        Line::from(format!(
+                            "Indexed candidates (2xx + indexable): {}",
+                            state
+                                .all_rows
+                                .iter()
+                                .filter(|row| {
+                                    (200..=299).contains(&row.status)
+                                        && row.indexability == "Indexable"
+                                })
+                                .count()
+                        )),
+                        Line::from(format!(
+                            "Top issues: {}",
+                            if top_issues.is_empty() {
+                                "none".to_string()
+                            } else {
+                                top_issues
+                            }
+                        )),
+                    ];
+                    let summary = Paragraph::new(summary_lines)
+                        .block(
+                            Block::default()
+                                .title("Site SEO Summary")
+                                .borders(Borders::ALL),
+                        )
+                        .wrap(Wrap { trim: true });
+                    f.render_widget(summary, chunks[2]);
+                }
+            }
+
+            let error_count = state.errors.len();
+            let last_error = state
+                .errors
+                .front()
+                .map(|e| truncate_for_log(e, 170))
+                .unwrap_or_else(|| "none".to_string());
+            let footer_status_style = if error_count > 0 {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if paused {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if state.done {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                state
-                    .errors
-                    .iter()
-                    .take(3)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" | ")
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             };
-            let footer = Paragraph::new(errors)
-                .block(Block::default().title("Errors").borders(Borders::ALL))
+            let footer_border_style = if error_count > 0 {
+                Style::default().fg(Color::Red)
+            } else if filter_mode {
+                Style::default().fg(Color::Yellow)
+            } else if paused {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            let state_label = if state.done {
+                "DONE"
+            } else if paused {
+                "PAUSED"
+            } else {
+                "LIVE"
+            };
+            let mode_label = if filter_mode {
+                "FILTER INPUT"
+            } else {
+                "NAVIGATION"
+            };
+            let pane_label = match active_panel {
+                ActivePanel::Pages => pages_pane.label(),
+                ActivePanel::Issues => issues_pane.label(),
+                ActivePanel::Summary => "summary",
+            };
+            let footer_lines = vec![
+                Line::from(vec![
+                    Span::styled("STATE ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(state_label, footer_status_style),
+                    Span::styled("   MODE ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(mode_label, Style::default().fg(Color::Yellow)),
+                    Span::styled("   PANEL ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(active_panel.title(), Style::default().fg(Color::Cyan)),
+                    Span::styled("   FOCUS ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(pane_label, Style::default().fg(Color::LightCyan)),
+                    Span::styled("   SORT ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(sort_mode.title(), Style::default().fg(Color::LightCyan)),
+                    Span::styled("   DIR ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        sort_direction.label(),
+                        Style::default().fg(Color::LightCyan),
+                    ),
+                    Span::styled("   FILTER ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        if filter.is_empty() { "none" } else { &filter },
+                        Style::default().fg(if filter.is_empty() {
+                            Color::DarkGray
+                        } else {
+                            Color::White
+                        }),
+                    ),
+                    Span::styled("   BUFFER ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        paused_events.len().to_string(),
+                        Style::default().fg(if paused_events.is_empty() {
+                            Color::Green
+                        } else {
+                            Color::Yellow
+                        }),
+                    ),
+                    Span::styled("   ERRORS ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        error_count.to_string(),
+                        Style::default().fg(if error_count > 0 {
+                            Color::Red
+                        } else {
+                            Color::Green
+                        }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("LAST ERROR ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        last_error,
+                        Style::default().fg(if error_count > 0 {
+                            Color::LightRed
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "q",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" quit  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "tab",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" next pane  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "shift+tab",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" prev pane  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "P I S",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" panels  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "up/down",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" select  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "dbl-click",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" open link  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "mod+click",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" force open  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "enter",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" open selected URL  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "r",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" sort  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "d",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" direction  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "/",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" filter  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "space",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" pause/resume  ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "esc/enter",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" exit filter", Style::default().fg(Color::Gray)),
+                ]),
+            ];
+
+            let footer = Paragraph::new(footer_lines)
+                .block(
+                    Block::default()
+                        .title("Command & Health Bar")
+                        .borders(Borders::ALL)
+                        .border_style(footer_border_style),
+                )
                 .wrap(Wrap { trim: true });
             f.render_widget(footer, chunks[3]);
         })?;
 
-        writer.flush()?;
+        if let Some(sink) = sink.as_mut() {
+            sink.flush()?;
+        }
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    if filter_mode {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Enter => filter_mode = false,
+                            KeyCode::Backspace => {
+                                filter.pop();
+                            }
+                            KeyCode::Char(ch) => {
+                                filter.push(ch);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Tab => match active_panel {
+                                ActivePanel::Pages => pages_pane = pages_pane.cycle(),
+                                ActivePanel::Issues => issues_pane = issues_pane.cycle(),
+                                ActivePanel::Summary => {}
+                            },
+                            KeyCode::BackTab => match active_panel {
+                                ActivePanel::Pages => pages_pane = pages_pane.reverse_cycle(),
+                                ActivePanel::Issues => issues_pane = issues_pane.reverse_cycle(),
+                                ActivePanel::Summary => {}
+                            },
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                active_panel = ActivePanel::Pages
+                            }
+                            KeyCode::Char('i') | KeyCode::Char('I') => {
+                                active_panel = ActivePanel::Issues
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                active_panel = ActivePanel::Summary
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                sort_mode = sort_mode.cycle()
+                            }
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                sort_direction = sort_direction.toggle()
+                            }
+                            KeyCode::Char('/') => filter_mode = true,
+                            KeyCode::Char(' ') => paused = !paused,
+                            KeyCode::Enter => match active_panel {
+                                ActivePanel::Pages => {
+                                    let selected =
+                                        page_table_state.selected().unwrap_or(selected_page_idx);
+                                    if let Some(url) = page_view_urls.get(selected)
+                                        && let Err(err) = open_url_in_browser(url)
+                                    {
+                                        state.push_error(format!(
+                                            "failed to open link in browser: {err}"
+                                        ));
+                                    }
+                                }
+                                ActivePanel::Issues => {
+                                    if issues_pane == IssuesPane::Urls {
+                                        let selected = issue_page_table_state
+                                            .selected()
+                                            .unwrap_or(selected_issue_page_idx);
+                                        if let Some(url) = issue_view_urls.get(selected)
+                                            && let Err(err) = open_url_in_browser(url)
+                                        {
+                                            state.push_error(format!(
+                                                "failed to open link in browser: {err}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                ActivePanel::Summary => {}
+                            },
+                            KeyCode::Up => match active_panel {
+                                ActivePanel::Pages => {
+                                    if pages_pane == PagesPane::Table {
+                                        selected_page_idx = selected_page_idx.saturating_sub(1);
+                                    }
+                                }
+                                ActivePanel::Issues => {
+                                    if issues_pane == IssuesPane::Distribution {
+                                        selected_issue_idx = selected_issue_idx.saturating_sub(1);
+                                    } else {
+                                        selected_issue_page_idx =
+                                            selected_issue_page_idx.saturating_sub(1);
+                                    }
+                                }
+                                ActivePanel::Summary => {}
+                            },
+                            KeyCode::Down => match active_panel {
+                                ActivePanel::Pages => {
+                                    if pages_pane == PagesPane::Table {
+                                        selected_page_idx = selected_page_idx.saturating_add(1);
+                                    }
+                                }
+                                ActivePanel::Issues => {
+                                    if issues_pane == IssuesPane::Distribution {
+                                        selected_issue_idx = selected_issue_idx.saturating_add(1);
+                                    } else {
+                                        selected_issue_page_idx =
+                                            selected_issue_page_idx.saturating_add(1);
+                                    }
+                                }
+                                ActivePanel::Summary => {}
+                            },
+                            _ => {}
+                        }
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    let modifier_held = mouse.modifiers.intersects(
+                        KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    );
+                    hovered_page_url_idx = None;
+                    hovered_issue_url_idx = None;
+
+                    if modifier_held {
+                        if active_panel == ActivePanel::Pages
+                            && let Some(area) = page_table_area
+                            && let Some(row_idx) = table_row_index_at(area, mouse.row)
+                            && row_idx < page_view_urls.len()
+                            && point_in_rect(mouse.column, mouse.row, area)
+                        {
+                            hovered_page_url_idx = Some(row_idx);
+                        }
+                        if active_panel == ActivePanel::Issues
+                            && let Some(area) = issue_urls_area
+                            && let Some(row_idx) = table_row_index_at(area, mouse.row)
+                            && row_idx < issue_view_urls.len()
+                            && point_in_rect(mouse.column, mouse.row, area)
+                        {
+                            hovered_issue_url_idx = Some(row_idx);
+                        }
+                    }
+
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        match active_panel {
+                            ActivePanel::Pages => {
+                                if let Some(area) = page_table_area
+                                    && let Some(row_idx) = table_row_index_at(area, mouse.row)
+                                    && row_idx < page_view_urls.len()
+                                    && point_in_rect(mouse.column, mouse.row, area)
+                                {
+                                    selected_page_idx = row_idx;
+                                    page_table_state.select(Some(selected_page_idx));
+                                    let now = Instant::now();
+                                    let double_click = last_page_click
+                                        .map(|(prev_idx, prev_time)| {
+                                            prev_idx == selected_page_idx
+                                                && now.duration_since(prev_time)
+                                                    <= Duration::from_millis(450)
+                                        })
+                                        .unwrap_or(false);
+                                    if (double_click || modifier_held)
+                                        && let Some(url) = page_view_urls.get(selected_page_idx)
+                                        && let Err(err) = open_url_in_browser(url)
+                                    {
+                                        state.push_error(format!(
+                                            "failed to open link in browser: {err}"
+                                        ));
+                                    }
+                                    last_page_click = Some((selected_page_idx, now));
+                                }
+                            }
+                            ActivePanel::Issues => {
+                                if let Some(area) = issue_distribution_area
+                                    && let Some(row_idx) = table_row_index_at(area, mouse.row)
+                                    && point_in_rect(mouse.column, mouse.row, area)
+                                {
+                                    selected_issue_idx = row_idx;
+                                    issue_table_state.select(Some(selected_issue_idx));
+                                    issues_pane = IssuesPane::Distribution;
+                                }
+                                if let Some(area) = issue_urls_area
+                                    && let Some(row_idx) = table_row_index_at(area, mouse.row)
+                                    && row_idx < issue_view_urls.len()
+                                    && point_in_rect(mouse.column, mouse.row, area)
+                                {
+                                    selected_issue_page_idx = row_idx;
+                                    issue_page_table_state.select(Some(selected_issue_page_idx));
+                                    issues_pane = IssuesPane::Urls;
+                                    let now = Instant::now();
+                                    let double_click = last_issue_url_click
+                                        .map(|(prev_idx, prev_time)| {
+                                            prev_idx == selected_issue_page_idx
+                                                && now.duration_since(prev_time)
+                                                    <= Duration::from_millis(450)
+                                        })
+                                        .unwrap_or(false);
+                                    if (double_click || modifier_held)
+                                        && let Some(url) =
+                                            issue_view_urls.get(selected_issue_page_idx)
+                                        && let Err(err) = open_url_in_browser(url)
+                                    {
+                                        state.push_error(format!(
+                                            "failed to open link in browser: {err}"
+                                        ));
+                                    }
+                                    last_issue_url_click = Some((selected_issue_page_idx, now));
+                                }
+                            }
+                            ActivePanel::Summary => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -675,13 +2328,21 @@ fn draw_loop(
         }
     }
 
-    writer.flush()?;
+    if let Some(sink) = sink.as_mut() {
+        sink.finalize()?;
+    }
     Ok(())
 }
 
 async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
-    let mut website = Website::new(&cli.url);
-    let root_host = Url::parse(&cli.url)
+    let Some(start_url) = cli.url.clone() else {
+        let _ = tx.send(CrawlEvent::Error("missing URL".to_string()));
+        let _ = tx.send(CrawlEvent::Finished);
+        return;
+    };
+
+    let mut website = Website::new(&start_url);
+    let root_host = Url::parse(&start_url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()));
 
@@ -712,7 +2373,7 @@ async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
     let mut driver_process: Option<Child> = None;
     let mut active_browser = cli.webdriver_browser;
     if enable_webdriver {
-        match prepare_webdriver_backend(&cli, &cli.url, &webdriver_url, &tx).await {
+        match prepare_webdriver_backend(&cli, &start_url, &webdriver_url, &tx).await {
             Ok((ready_endpoint, managed_child, browser)) => {
                 webdriver_url = ready_endpoint;
                 driver_process = managed_child;
@@ -728,7 +2389,7 @@ async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
                         "WebDriver unavailable ({err}); aborting because --webdriver-required is set"
                     )));
                     let _ = tx.send(CrawlEvent::Unretrieved {
-                        url: cli.url.clone(),
+                        url: start_url.clone(),
                         reason: format!("webdriver required but unavailable: {err}"),
                     });
                     let _ = tx.send(CrawlEvent::Finished);
@@ -747,7 +2408,7 @@ async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
             &webdriver_url,
             active_browser,
             cli.webdriver_headless,
-            &cli.url,
+            &start_url,
             depth_limit,
             cli.seed_sitemap,
             retry_missing,
@@ -763,7 +2424,7 @@ async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
                 });
                 if discovered_count == 0 {
                     let _ = tx.send(CrawlEvent::Unretrieved {
-                        url: cli.url.clone(),
+                        url: start_url.clone(),
                         reason: "browser backend discovered zero URLs".to_string(),
                     });
                 }
@@ -778,7 +2439,7 @@ async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
                 stop_webdriver(driver_process.take());
                 if cli.webdriver_required {
                     let _ = tx.send(CrawlEvent::Unretrieved {
-                        url: cli.url.clone(),
+                        url: start_url.clone(),
                         reason: format!("webdriver required but browser discovery failed: {err}"),
                     });
                     let _ = tx.send(CrawlEvent::Finished);
@@ -842,7 +2503,7 @@ async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
                         }
                     }
                 }
-                let (mut row, discovered_links) = page_to_row(&page);
+                let (mut row, discovered_links) = page_to_row(&page, root_host.as_deref());
                 let filtered_links = filter_crawlable_links(discovered_links, root_host.as_deref());
                 row.link_count = filtered_links.len();
                 seen_urls.insert(row.url.clone());
@@ -868,7 +2529,7 @@ async fn run_crawler(cli: Cli, tx: UnboundedSender<CrawlEvent>) {
         Ok(discovered_urls) => {
             let mut candidate_urls = discovered_urls;
             candidate_urls.extend(discovered_from_pages);
-            candidate_urls.push(cli.url.clone());
+            candidate_urls.push(start_url.clone());
 
             let mut crawlable_candidates = candidate_urls
                 .into_iter()
@@ -1563,10 +3224,11 @@ async fn browser_discover_and_fetch(
             Ok((rendered_url, rendered_html)) => {
                 let rendered_url = normalize_crawl_url(&rendered_url).unwrap_or(rendered_url);
                 let page = Page::new(&rendered_url, &fetch_client).await;
-                let (mut row, _) = page_to_row(&page);
+                let (mut row, _) = page_to_row(&page, root_host);
                 row.url = rendered_url;
-                apply_rendered_html_to_row(&mut row, &rendered_html);
-                row.link_count = filtered.len();
+                apply_rendered_html_to_row(&mut row, &rendered_html, root_host);
+                row.internal_link_count = filtered.len();
+                row.link_count = row.internal_link_count + row.external_link_count;
                 let _ = tx.send(CrawlEvent::Page {
                     row,
                     discovered_links: filtered.clone(),
@@ -2834,7 +4496,7 @@ async fn process_single_url(
     }
 
     if let Some(page) = last_page {
-        let (mut row, discovered_links) = page_to_row(&page);
+        let (mut row, discovered_links) = page_to_row(&page, root_host_ref);
         row.url = fetch_url.clone();
         let filtered_links = filter_crawlable_links(discovered_links, root_host_ref);
         row.link_count = filtered_links.len();
@@ -2932,6 +4594,15 @@ async fn raw_redirect_rows(
             redirect_url: resolved_target.clone(),
             redirect_type: redirect_class(status).to_string(),
             link_count: 1,
+            internal_link_count: 1,
+            external_link_count: 0,
+            h1_count: 0,
+            h2_count: 0,
+            image_count: 0,
+            image_missing_alt_count: 0,
+            structured_data_count: 0,
+            seo_score: 100,
+            issues: Vec::new(),
             crawl_timestamp: Utc::now().to_rfc3339(),
         };
         rows.push((row, vec![resolved_target.clone()]));
@@ -2966,30 +4637,18 @@ async fn send_redirect_probe_request(
     Err(last_error)
 }
 
-fn page_to_row(page: &spider::page::Page) -> (CrawlRow, Vec<String>) {
+fn page_to_row(page: &spider::page::Page, root_host: Option<&str>) -> (CrawlRow, Vec<String>) {
     let html = page.get_html();
     let doc = Html::parse_document(&html);
 
     let mut title = extract_title(&doc);
     let meta = extract_meta_description(&doc);
     let h1 = extract_real_h1(&doc);
-    if title.is_empty() {
-        title = h1.clone();
-    }
-    let canonical = extract_canonical(&doc);
-
     let mime = header_value(page, "content-type")
         .map(|v| v.split(';').next().unwrap_or("").trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| infer_mime_from_page(page));
-
     let status = page.status_code.as_u16();
-    let noindex = has_noindex(&doc, page);
-    let indexability = if (200..=299).contains(&status) && !noindex {
-        "Indexable".to_string()
-    } else {
-        "Non-Indexable".to_string()
-    };
 
     let requested_url_raw = page.get_url().to_string();
     let final_url_raw = page.get_url_final().to_string();
@@ -3019,7 +4678,39 @@ fn page_to_row(page: &spider::page::Page) -> (CrawlRow, Vec<String>) {
         String::new()
     };
 
-    let word_count = count_words(&doc);
+    if title.is_empty() {
+        title = h1.clone();
+    }
+    let canonical = extract_canonical(&doc, &row_url);
+    let noindex = has_noindex(&doc, page);
+    let is_html = mime.to_ascii_lowercase().contains("html");
+    let h1_count = if is_html {
+        count_elements(&doc, "h1")
+    } else {
+        0
+    };
+    let h2_count = if is_html {
+        count_elements(&doc, "h2")
+    } else {
+        0
+    };
+    let (image_count, image_missing_alt_count) = if is_html {
+        image_alt_stats(&doc)
+    } else {
+        (0, 0)
+    };
+    let structured_data_count = if is_html {
+        count_structured_data_blocks(&doc)
+    } else {
+        0
+    };
+    let word_count = if is_html { count_words(&doc) } else { 0 };
+    let (doc_links, internal_link_count, external_link_count) = if is_html {
+        extract_crawl_links_with_breakdown(&doc, &row_url, root_host)
+    } else {
+        (Vec::new(), 0, 0)
+    };
+
     let size = page.get_html_bytes_u8().len();
     let response_time = page.get_duration_elapsed().as_millis();
     let last_modified = header_value(page, "last-modified").unwrap_or_default();
@@ -3029,7 +4720,29 @@ fn page_to_row(page: &spider::page::Page) -> (CrawlRow, Vec<String>) {
         .as_ref()
         .map(|links| links.iter().map(ToString::to_string).collect::<Vec<_>>())
         .unwrap_or_default();
-    discovered_links.extend(extract_alternate_links(&doc));
+    discovered_links.extend(doc_links);
+    let mut discovered_dedupe = HashSet::new();
+    discovered_links.retain(|link| discovered_dedupe.insert(link.clone()));
+
+    let issues = collect_row_issues(
+        status,
+        "retrieved",
+        is_html,
+        noindex,
+        title.chars().count(),
+        meta.chars().count(),
+        h1_count,
+        &canonical,
+        word_count,
+        image_missing_alt_count,
+        external_link_count,
+    );
+    let seo_score = compute_seo_score(&issues);
+    let indexability = if (200..=299).contains(&status) && !noindex {
+        "Indexable".to_string()
+    } else {
+        "Non-Indexable".to_string()
+    };
 
     (
         CrawlRow {
@@ -3051,19 +4764,35 @@ fn page_to_row(page: &spider::page::Page) -> (CrawlRow, Vec<String>) {
             redirect_url,
             redirect_type,
             link_count: discovered_links.len(),
+            internal_link_count,
+            external_link_count,
+            h1_count,
+            h2_count,
+            image_count,
+            image_missing_alt_count,
+            structured_data_count,
+            seo_score,
+            issues,
             crawl_timestamp: Utc::now().to_rfc3339(),
         },
         discovered_links,
     )
 }
 
-fn apply_rendered_html_to_row(row: &mut CrawlRow, html: &str) {
+fn apply_rendered_html_to_row(row: &mut CrawlRow, html: &str, root_host: Option<&str>) {
     let doc = Html::parse_document(html);
     let title = extract_title(&doc);
     let meta = extract_meta_description(&doc);
     let h1 = extract_real_h1(&doc);
-    let canonical = extract_canonical(&doc);
+    let canonical = extract_canonical(&doc, &row.url);
     let noindex = has_noindex_meta(&doc);
+    let h1_count = count_elements(&doc, "h1");
+    let h2_count = count_elements(&doc, "h2");
+    let (image_count, image_missing_alt_count) = image_alt_stats(&doc);
+    let structured_data_count = count_structured_data_blocks(&doc);
+    let (_, internal_link_count, external_link_count) =
+        extract_crawl_links_with_breakdown(&doc, &row.url, root_host);
+    let word_count = count_words(&doc);
 
     if !title.is_empty() {
         row.title = title;
@@ -3072,19 +4801,42 @@ fn apply_rendered_html_to_row(row: &mut CrawlRow, html: &str) {
     row.meta = meta;
     row.meta_length = row.meta.chars().count();
     row.h1 = h1;
+    row.h1_count = h1_count;
+    row.h2_count = h2_count;
     row.canonical = canonical;
-    row.word_count = count_words(&doc);
+    row.word_count = word_count;
     row.size = html.as_bytes().len();
+    row.image_count = image_count;
+    row.image_missing_alt_count = image_missing_alt_count;
+    row.structured_data_count = structured_data_count;
+    row.internal_link_count = internal_link_count;
+    row.external_link_count = external_link_count;
+    row.link_count = internal_link_count + external_link_count;
     row.mime = "text/html".to_string();
     row.indexability = if (200..=299).contains(&row.status) && !noindex {
         "Indexable".to_string()
     } else {
         "Non-Indexable".to_string()
     };
+    row.issues = collect_row_issues(
+        row.status,
+        &row.retrieval_status,
+        true,
+        noindex,
+        row.title_length,
+        row.meta_length,
+        row.h1_count,
+        &row.canonical,
+        row.word_count,
+        row.image_missing_alt_count,
+        row.external_link_count,
+    );
+    row.seo_score = compute_seo_score(&row.issues);
 }
 
 fn unretrieved_row(url: String, reason: String) -> CrawlRow {
     let reason_len = reason.chars().count();
+    let issues = vec![SeoIssue::NotRetrieved];
     CrawlRow {
         url,
         status: 0,
@@ -3104,6 +4856,15 @@ fn unretrieved_row(url: String, reason: String) -> CrawlRow {
         redirect_url: String::new(),
         redirect_type: String::new(),
         link_count: 0,
+        internal_link_count: 0,
+        external_link_count: 0,
+        h1_count: 0,
+        h2_count: 0,
+        image_count: 0,
+        image_missing_alt_count: 0,
+        structured_data_count: 0,
+        seo_score: compute_seo_score(&issues),
+        issues,
         crawl_timestamp: Utc::now().to_rfc3339(),
     }
 }
@@ -3220,7 +4981,7 @@ fn extract_meta_description(doc: &Html) -> String {
     extract_meta_content(doc, "meta[name=\"twitter:description\"]")
 }
 
-fn extract_canonical(doc: &Html) -> String {
+fn extract_canonical(doc: &Html, page_url: &str) -> String {
     let selector = match Selector::parse("link[rel=\"canonical\"]") {
         Ok(s) => s,
         Err(_) => return String::new(),
@@ -3230,23 +4991,42 @@ fn extract_canonical(doc: &Html) -> String {
         .next()
         .and_then(|el| el.value().attr("href"))
         .map(normalize_text)
+        .and_then(|href| resolve_href(page_url, &href).or(Some(href)))
         .unwrap_or_default()
 }
 
-fn extract_alternate_links(doc: &Html) -> Vec<String> {
+fn extract_crawl_links_with_breakdown(
+    doc: &Html,
+    page_url: &str,
+    root_host: Option<&str>,
+) -> (Vec<String>, usize, usize) {
     let selector =
         match Selector::parse("link[rel=\"alternate\"][href], link[hreflang][href], a[href]") {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), 0, 0),
         };
 
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut internal_count = 0usize;
+    let mut external_count = 0usize;
     for el in doc.select(&selector) {
         if let Some(href) = el.value().attr("href") {
-            out.push(href.trim().to_string());
+            let href = href.trim();
+            let Some(resolved) = resolve_href(page_url, href) else {
+                continue;
+            };
+            if is_same_host(&resolved, root_host) {
+                internal_count += 1;
+            } else {
+                external_count += 1;
+            }
+            if seen.insert(resolved.clone()) {
+                out.push(resolved);
+            }
         }
     }
-    out
+    (out, internal_count, external_count)
 }
 
 fn has_noindex(doc: &Html, page: &spider::page::Page) -> bool {
@@ -3271,6 +5051,195 @@ fn has_noindex_meta(doc: &Html) -> bool {
             .map(|c| c.to_ascii_lowercase().contains("noindex"))
             .unwrap_or(false)
     })
+}
+
+fn resolve_href(page_url: &str, href: &str) -> Option<String> {
+    if href.is_empty()
+        || href.starts_with('#')
+        || href.starts_with("mailto:")
+        || href.starts_with("javascript:")
+        || href.starts_with("tel:")
+    {
+        return None;
+    }
+
+    let resolved = if href.starts_with("http://") || href.starts_with("https://") {
+        href.to_string()
+    } else {
+        let base = Url::parse(page_url).ok()?;
+        base.join(href).ok()?.to_string()
+    };
+    normalize_crawl_url(&resolved)
+}
+
+fn count_elements(doc: &Html, selector: &str) -> usize {
+    Selector::parse(selector)
+        .ok()
+        .map(|sel| doc.select(&sel).count())
+        .unwrap_or(0)
+}
+
+fn image_alt_stats(doc: &Html) -> (usize, usize) {
+    let selector = match Selector::parse("img") {
+        Ok(sel) => sel,
+        Err(_) => return (0, 0),
+    };
+    let mut total = 0usize;
+    let mut missing_alt = 0usize;
+    for el in doc.select(&selector) {
+        total += 1;
+        let alt = el.value().attr("alt").unwrap_or_default().trim();
+        if alt.is_empty() {
+            missing_alt += 1;
+        }
+    }
+    (total, missing_alt)
+}
+
+fn count_structured_data_blocks(doc: &Html) -> usize {
+    let selector = match Selector::parse("script[type=\"application/ld+json\"]") {
+        Ok(sel) => sel,
+        Err(_) => return 0,
+    };
+    doc.select(&selector)
+        .filter(|el| !normalize_text(&el.text().collect::<Vec<_>>().join(" ")).is_empty())
+        .count()
+}
+
+fn collect_row_issues(
+    status: u16,
+    retrieval_status: &str,
+    is_html: bool,
+    noindex: bool,
+    title_length: usize,
+    meta_length: usize,
+    h1_count: usize,
+    canonical: &str,
+    word_count: usize,
+    image_missing_alt_count: usize,
+    external_link_count: usize,
+) -> Vec<SeoIssue> {
+    let mut issues = Vec::new();
+    if retrieval_status != "retrieved" {
+        issues.push(SeoIssue::NotRetrieved);
+        return issues;
+    }
+    if (400..=499).contains(&status) {
+        issues.push(SeoIssue::Http4xx);
+    }
+    if (500..=599).contains(&status) {
+        issues.push(SeoIssue::Http5xx);
+    }
+
+    if !is_html || !(200..=299).contains(&status) {
+        return issues;
+    }
+
+    if noindex {
+        issues.push(SeoIssue::Noindex);
+    }
+    if title_length == 0 {
+        issues.push(SeoIssue::MissingTitle);
+    } else if title_length < 15 {
+        issues.push(SeoIssue::TitleTooShort);
+    } else if title_length > 60 {
+        issues.push(SeoIssue::TitleTooLong);
+    }
+
+    if meta_length == 0 {
+        issues.push(SeoIssue::MissingMetaDescription);
+    } else if meta_length < 70 {
+        issues.push(SeoIssue::MetaDescriptionTooShort);
+    } else if meta_length > 160 {
+        issues.push(SeoIssue::MetaDescriptionTooLong);
+    }
+
+    if h1_count == 0 {
+        issues.push(SeoIssue::MissingH1);
+    } else if h1_count > 1 {
+        issues.push(SeoIssue::MultipleH1);
+    }
+
+    if canonical.trim().is_empty() {
+        issues.push(SeoIssue::MissingCanonical);
+    }
+
+    if word_count < 120 {
+        issues.push(SeoIssue::LowWordCount);
+    }
+
+    if image_missing_alt_count > 0 {
+        issues.push(SeoIssue::ImagesMissingAlt);
+    }
+
+    if external_link_count > 60 {
+        issues.push(SeoIssue::TooManyExternalLinks);
+    }
+
+    issues
+}
+
+fn compute_seo_score(issues: &[SeoIssue]) -> u8 {
+    let penalty = issues
+        .iter()
+        .map(|issue| issue.penalty() as u16)
+        .sum::<u16>();
+    (100u16.saturating_sub(penalty)) as u8
+}
+
+fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
+    let right = rect.x.saturating_add(rect.width);
+    let bottom = rect.y.saturating_add(rect.height);
+    x >= rect.x && x < right && y >= rect.y && y < bottom
+}
+
+fn table_row_index_at(area: Rect, mouse_row: u16) -> Option<usize> {
+    if area.height <= 3 {
+        return None;
+    }
+    let first_data_row = area.y.saturating_add(2);
+    let last_data_row = area.y + area.height - 1;
+    if mouse_row >= first_data_row && mouse_row < last_data_row {
+        Some((mouse_row - first_data_row) as usize)
+    } else {
+        None
+    }
+}
+
+fn open_url_in_browser(url: &str) -> Result<(), String> {
+    if url.trim().is_empty() {
+        return Err("empty URL".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.arg(url);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", url]);
+        cmd
+    };
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+
+    Ok(())
 }
 
 fn count_words(doc: &Html) -> usize {
@@ -3332,5 +5301,16 @@ fn status_code_style(code: u16) -> Style {
         400..=499 => Style::default().fg(Color::Red),
         500..=599 => Style::default().fg(Color::Magenta),
         _ => Style::default().fg(Color::Gray),
+    }
+}
+
+fn seo_score_style(score: u8) -> Style {
+    match score {
+        85..=100 => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        70..=84 => Style::default().fg(Color::LightGreen),
+        50..=69 => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     }
 }

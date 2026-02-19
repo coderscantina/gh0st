@@ -1,0 +1,65 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# GitHub
+.github
+
+# Documentation
+*.md
+!README.md
+LICENSE
+CONTRIBUTING.md
+CHANGELOG.md
+
+# Build artifacts
+target/
+dist/
+*.tar.gz
+*.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Tests
+tests/
+benches/
+
+# CI/CD
+.travis.yml
+.gitlab-ci.yml
+azure-pipelines.yml
+
+# Scripts
+install.sh
+install.ps1
+Makefile
+
+# Logs
+*.log
+*.log.*
+
+# Output files
+*.csv
+*.json
+crawl-*.csv
+results.*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Cache
+.cache/

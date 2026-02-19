@@ -1,7 +1,14 @@
 [package]
-name = "spider"
+name = "gh0st"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Michael Wallner"]
+description = "Phantom-fast web crawling and SEO analysis in your terminal"
+license = "MIT"
+repository = "https://github.com/yourusername/gh0st"
+keywords = ["crawler", "seo", "tui", "web-scraper", "spider"]
+categories = ["command-line-utilities", "web-programming"]
+readme = "README.md"
 
 [dependencies]
 chrono = { version = "0.4", features = ["clock"] }
