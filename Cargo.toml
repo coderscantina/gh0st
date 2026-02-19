@@ -1,0 +1,93 @@
+[package]
+name = "gh0st"
+version = "2026.2.19"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Michael Wallner"]
+description = "Phantom-fast web crawling and SEO analysis in your terminal"
+documentation = "https://github.com/yourusername/gh0st#readme"
+homepage = "https://github.com/yourusername/gh0st"
+repository = "https://github.com/yourusername/gh0st"
+license = "MIT"
+keywords = ["crawler", "seo", "tui", "web-scraper", "spider"]
+categories = ["command-line-utilities", "web-programming"]
+readme = "README.md"
+exclude = [".github/*", ".gitignore", "*.md", "docs/*", "tests/*", "scripts/*"]
+
+[[bin]]
+name = "gh0st"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+] }
+clap = { version = "4.5", features = ["derive", "cargo"] }
+crossterm = { version = "0.29", default-features = false }
+csv = "1.4"
+flate2 = { version = "1.1", default-features = false, features = [
+  "rust_backend",
+] }
+ratatui = { version = "0.30", default-features = false, features = [
+  "crossterm",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+] }
+scraper = "0.25"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+spider = { version = "2.45", default-features = false, features = [
+  "sync",
+  "time",
+  "headers",
+], optional = true }
+tar = "0.4"
+tokio = { version = "1.49", default-features = false, features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+url = "2.5"
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
+
+[features]
+default = ["spider-core", "webdriver"]
+spider-core = ["dep:spider"]
+webdriver = ["spider?/webdriver"]
+full = ["spider-core", "webdriver"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-optimized]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Small binary size profile (use with: cargo build --profile small)
+[profile.small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
