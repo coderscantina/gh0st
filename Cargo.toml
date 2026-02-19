@@ -1,6 +1,6 @@
 [package]
 name = "gh0st"
-version = "0.1.0"
+version = "2026.2.19"
 edition = "2021"
 authors = ["Michael Wallner"]
 description = "Phantom-fast web crawling and SEO analysis in your terminal"
